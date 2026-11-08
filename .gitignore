@@ -1,5 +1,10 @@
 /target
 .DS_Store
 
-# Generated protobuf sources in gen/ are versioned; see proto/README.md.
+# Generated Python protobuf sources; Rust sources remain versioned for native Git builds.
+/gen/python/egglog/
+/gen/python/buf/
+/gen/python/build/
+/gen/python/dist/
+/gen/python/*.egg-info/
 __pycache__/

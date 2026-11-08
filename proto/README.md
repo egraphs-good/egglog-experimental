@@ -213,13 +213,16 @@ checked separately.
 ## Generated messages and checks
 
 Generated Python messages use `protobuf-py`; Rust uses `prost` in the
-`egglog-proto` crate. This integration checkout versions message sources under
-`gen/python` and `gen/rust` so downstream Git dependencies build without a
-generation step. Regenerate them with `make proto-gen` after schema changes.
-The separate schema-only branch ignores generated message sources and requires
-`make proto-gen` before building either SDK. Package manifests, root modules
-and licenses remain versioned in both. No gRPC transport is generated or
-required. Consumers must
+`egglog-proto` crate. Generated Python modules are ignored. Building the Python
+SDK from Git requires the Buf CLI; its PEP 517 backend installs the pinned
+Python plugin and regenerates from the schema and `buf.lock`. It does not need
+the Rust plugin. Wheels and source distributions include those generated
+modules; building a wheel from a source distribution does not run Buf.
+This integration checkout keeps generated Rust messages versioned for native
+Git dependencies. The separate schema-only branch ignores Rust outputs and
+requires `make proto-gen` before building the Rust SDK. Package manifests, root
+modules and licenses remain versioned in both. No gRPC transport is generated
+or required. Consumers must
 select matching schema revisions: the `egglog.v1` package name is not a version
 handshake in raw bytes.
 
@@ -237,6 +240,9 @@ make proto-gen
 make proto-lint
 make proto-test
 ```
+
+Build the Python SDK alone with `uv build gen/python`; only Buf is an external
+codegen prerequisite. `make proto-gen` regenerates both SDKs.
 
 `make proto-test` validates wire/CEL behavior after generation; it does not
 execute Egglog or independently check proofs.
